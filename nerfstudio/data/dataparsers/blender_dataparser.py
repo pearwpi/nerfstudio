@@ -71,10 +71,11 @@ class Blender(DataParser):
         meta = load_from_json(self.data / f"transforms_{split}.json")
         image_filenames = []
         poses = []
-        for frame in meta["frames"]:
-            fname = self.data / Path(frame["file_path"].replace("./", "") + ".png")
+        for frame in meta["frames"][::10]:
+            fname = self.data / Path(frame["file_path"])
             image_filenames.append(fname)
             poses.append(np.array(frame["transform_matrix"]))
+            print(frame["transform_matrix"], fname)
         poses = np.array(poses).astype(np.float32)
 
         img_0 = imageio.v2.imread(image_filenames[0])
@@ -84,8 +85,7 @@ class Blender(DataParser):
 
         cx = image_width / 2.0
         cy = image_height / 2.0
-        camera_to_world = torch.from_numpy(poses[:, :3])  # camera to world transform
-
+        camera_to_world = torch.from_numpy(poses[:, :3])  # camera to world transfor
         # in x,y,z order
         camera_to_world[..., 3] *= self.scale_factor
         scene_box = SceneBox(aabb=torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]], dtype=torch.float32))
