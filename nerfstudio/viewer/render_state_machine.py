@@ -150,6 +150,7 @@ class RenderStateMachine(threading.Thread):
                     self.viewer.get_model().set_background(background_color)  # type: ignore[reportCallIssue]
                 was_training = self.viewer.get_model().training
                 self.viewer.get_model().eval()
+                print(obb)
                 try:
                     if self.viewer.control_panel.crop_viewport:
                         color = self.viewer.control_panel.background_color
@@ -227,6 +228,8 @@ class RenderStateMachine(threading.Thread):
             self.state = self.transitions[self.state][action.action]
             try:
                 outputs = self._render_img(action.camera_state)
+                # print(action.camera_state.c2w)
+
             except viewer_utils.IOChangeException:
                 # if we got interrupted, don't send the output to the viewer
                 continue

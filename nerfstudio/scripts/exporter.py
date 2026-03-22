@@ -612,7 +612,9 @@ class ExportGaussianSplat(Exporter):
             for i in range(4):
                 map_to_tensors[f"rot_{i}"] = quats[:, i, None]
 
+            print("before", self.obb_center, self.obb_rotation, self.obb_scale)
             if self.obb_center is not None and self.obb_rotation is not None and self.obb_scale is not None:
+                print(self.obb_center, self.obb_rotation, self.obb_scale)
                 crop_obb = OrientedBox.from_params(self.obb_center, self.obb_rotation, self.obb_scale)
                 assert crop_obb is not None
                 mask = crop_obb.within(torch.from_numpy(positions)).numpy()
