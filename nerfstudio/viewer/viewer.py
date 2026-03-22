@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import contextlib
 import threading
 import time
@@ -129,6 +131,20 @@ class Viewer:
             self.viewer_info = [f"Viewer running locally at: http://localhost:{websocket_port} (listening on 0.0.0.0)"]
         else:
             self.viewer_info = [f"Viewer running locally at: http://{config.websocket_host}:{websocket_port}"]
+
+        # CHANGES
+        # Inside the Viewer class, after self.viewer_info is set
+        self.save_format = self.viser_server.gui.add_dropdown(
+            label="Select Save Format",
+            options=["json"]
+        )
+
+        self.save_button = self.viser_server.gui.add_button(
+            label="Save Render Settings"
+        )
+        self.save_button.on_click(lambda _: self.save_camera_pose())
+        
+
 
         buttons = (
             viser.theme.TitlebarButton(
@@ -290,6 +306,34 @@ class Viewer:
             )
         self.ready = True
 
+    def save_camera_pose(self):
+        """Saves the camera pose (c2w matrix) to a file in the selected format."""
+        clients = self.viser_server.get_clients()
+        
+        # Collect all camera matrices
+        # camera_poses = {}
+        camera_data = {}
+        for client_id, client in clients.items():
+            camera_state = self.get_camera_state(client)
+            # camera_poses[f"camera_{client_id}"] = camera_state.c2w.tolist()
+            camera_data[f"camera"] = {
+                "c2w_matrix": camera_state.c2w.tolist(),
+                "render_resolution": self.control_panel.max_res, 
+                "fov_radians": client.camera.fov,
+            }
+            
+        # Determine format
+        file_format = "json"
+        folder_path = "vizflyt_viewer/render_settings"
+        file_path = f"{folder_path}/render_config_block1min.{file_format}"
+        os.makedirs(folder_path, exist_ok=True)
+        
+        if file_format == "json":
+            with open(file_path, "w") as f:
+                json.dump(camera_data, f, indent=4)
+        
+        print(f"Saved render setting saved to {file_path}")
+
     def toggle_pause_button(self) -> None:
         self.pause_train.visible = not self.pause_train.visible
         self.resume_train.visible = not self.resume_train.visible
@@ -314,11 +358,26 @@ class Viewer:
         self.stats_markdown.content = self.make_stats_markdown(step, None)
 
     def get_camera_state(self, client: viser.ClientHandle) -> CameraState:
+        
         R = vtf.SO3(wxyz=client.camera.wxyz)
         R = R @ vtf.SO3.from_x_radians(np.pi)
         R = torch.tensor(R.as_matrix())
         pos = torch.tensor(client.camera.position, dtype=torch.float64) / VISER_NERFSTUDIO_SCALE_RATIO
-        c2w = torch.concatenate([R, pos[:, None]], dim=1)
+        c2w = torch.concatenate([R, pos[:, None]], dim=1)        
+        
+        print('Currentcamera pose ', pos.numpy())
+
+        # Print Camera Extrinsics
+        print("\nCamera Extrinsics (c2w matrix)")
+        print(c2w.numpy())
+        
+        # # Print Camera Settings
+        # print("\nCamera Settings:")
+        
+        # print(f"    - Current Resolution: {self.control_panel.max_res}")
+        # print(f"    - Field of View (FOV): {client.camera.fov} radians")
+        # print(f"    - Image Height: {self.control_panel.max_res}")
+        # print(f"    - Image Width: {int(self.control_panel.max_res * client.camera.aspect)}")
         if self.ready and self.render_tab_state.preview_render:
             camera_type = self.render_tab_state.preview_camera_type
             camera_state = CameraState(
