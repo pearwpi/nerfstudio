@@ -112,6 +112,10 @@ class Viewer:
         self.last_move_time = 0
         # track the camera index that last being clicked
         self.current_camera_idx = 0
+        self.num_train_images = 0
+        self.train_camera_c2ws: Optional[np.ndarray] = None
+        # keep one persistent pose notification per connected client
+        self.pose_notifications: Dict[int, viser.NotificationHandle] = {}
 
         self.viser_server = viser.ViserServer(host=config.websocket_host, port=websocket_port)
         # Set the name of the URL either to the share link if available, or the localhost
@@ -209,8 +213,19 @@ class Viewer:
         self.show_images.on_click(lambda _: self.set_camera_visibility(True))
         self.show_images.on_click(lambda _: self.toggle_cameravis_button())
         self.show_images.visible = False
+
+        # Toggle model background rendering. When disabled, only scene primitives (e.g. train cams) are shown.
+        self.render_model_checkbox = self.viser_server.gui.add_checkbox("Render Model", initial_value=True)
+        self.render_model_checkbox.on_update(lambda _: self._set_model_rendering_enabled())
+        self.image_index_input = self.viser_server.gui.add_number(
+            "Go To Train Image Index", initial_value=0, min=0, max=0, step=1
+        )
+        self.go_to_image_button = self.viser_server.gui.add_button("Go To Image")
+        self.go_to_image_button.on_click(lambda event: self._go_to_train_image_index(event.client))
+
         mkdown = self.make_stats_markdown(0, "0x0px")
         self.stats_markdown = self.viser_server.gui.add_markdown(mkdown)
+        self.selected_pose_markdown = self.viser_server.gui.add_markdown(self._format_pose_markdown(None, None))
         tabs = self.viser_server.gui.add_tab_group()
         control_tab = tabs.add_tab("Control", viser.Icon.SETTINGS)
         with control_tab:
@@ -342,6 +357,108 @@ class Viewer:
         self.hide_images.visible = not self.hide_images.visible
         self.show_images.visible = not self.show_images.visible
 
+    def _set_model_rendering_enabled(self) -> None:
+        """Enable or disable model rendering into the viewer background image."""
+        clients = self.viser_server.get_clients()
+        for client_id, client in clients.items():
+            if not self.render_model_checkbox.value:
+                # Immediately clear rendered background so only train cameras and other scene nodes remain.
+                client.scene.set_background_image(None, depth=None)
+                if client_id in self.render_statemachines:
+                    self.render_statemachines[client_id].interrupt_render_flag = True
+                continue
+
+            # Trigger a fresh render when re-enabling model output.
+            camera_state = self.get_camera_state(client)
+            if client_id in self.render_statemachines:
+                self.render_statemachines[client_id].action(RenderAction("rerender", camera_state))
+
+    def _extract_pose_xyz_quat(self, c2w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Extract translation and quaternion (xyzw) from c2w pose."""
+        xyz = c2w[:3, 3].astype(np.float64)
+        quat_wxyz = np.asarray(vtf.SO3.from_matrix(c2w[:3, :3]).wxyz, dtype=np.float64)
+        quat_xyzw = quat_wxyz[[1, 2, 3, 0]]
+        return xyz, quat_xyzw
+
+    def _format_pose_markdown(self, idx: Optional[int], c2w: Optional[np.ndarray]) -> str:
+        """Format the selected camera pose for display in the viewer UI."""
+        if idx is None or c2w is None:
+            return "Selected Train Pose: _none_"
+
+        xyz, quat_xyzw = self._extract_pose_xyz_quat(c2w)
+        xyz_str = ", ".join(f"{val:+.5f}" for val in xyz)
+        quat_str = ", ".join(f"{val:+.5f}" for val in quat_xyzw)
+        return (
+            "Selected Train Pose  \n"
+            f"Image Index: `{idx}`  \n"
+            f"xyz: `[{xyz_str}]`  \n"
+            f"quat_xyzw: `[{quat_str}]`"
+        )
+
+    def _update_selected_pose_display(
+        self,
+        client: viser.ClientHandle,
+        idx: int,
+        c2w: np.ndarray,
+    ) -> None:
+        """Update selected pose display in the GUI and as a client-local corner notification."""
+        self.selected_pose_markdown.content = self._format_pose_markdown(idx, c2w)
+        xyz, quat_xyzw = self._extract_pose_xyz_quat(c2w)
+        notification_body = (
+            f"xyz: [{', '.join(f'{val:+.5f}' for val in xyz)}]\n"
+            f"quat_xyzw: [{', '.join(f'{val:+.5f}' for val in quat_xyzw)}]"
+        )
+
+        notif = self.pose_notifications.get(client.client_id)
+        if notif is None:
+            self.pose_notifications[client.client_id] = client.add_notification(
+                title=f"Train Image {idx} Pose",
+                body=notification_body,
+                with_close_button=True,
+                auto_close_seconds=None,
+                color="blue",
+            )
+        else:
+            notif.title = f"Train Image {idx} Pose"
+            notif.body = notification_body
+
+    def _go_to_train_image_index(self, client: Optional[viser.ClientHandle]) -> None:
+        """Move viewport camera to the requested train image index."""
+        if self.train_camera_c2ws is None or self.num_train_images <= 0:
+            return
+
+        requested_idx = int(round(float(self.image_index_input.value)))
+        clamped_idx = int(np.clip(requested_idx, 0, self.num_train_images - 1))
+        if clamped_idx != requested_idx:
+            self.image_index_input.value = clamped_idx
+
+        c2w = self.train_camera_c2ws[clamped_idx]
+        rot = vtf.SO3.from_matrix(c2w[:3, :3])
+        viewer_rot = rot @ vtf.SO3.from_x_radians(np.pi)
+        position = c2w[:3, 3] * VISER_NERFSTUDIO_SCALE_RATIO
+
+        target_clients: Dict[int, viser.ClientHandle]
+        if client is not None:
+            target_clients = {client.client_id: client}
+        else:
+            target_clients = self.viser_server.get_clients()
+
+        for _, target_client in target_clients.items():
+            with target_client.atomic():
+                target_client.camera.position = (
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                )
+                target_client.camera.wxyz = (
+                    float(viewer_rot.wxyz[0]),
+                    float(viewer_rot.wxyz[1]),
+                    float(viewer_rot.wxyz[2]),
+                    float(viewer_rot.wxyz[3]),
+                )
+            self.current_camera_idx = clamped_idx
+            self._update_selected_pose_display(target_client, clamped_idx, c2w)
+
     def make_stats_markdown(self, step: Optional[int], res: Optional[str]) -> str:
         # if either are None, read it from the current stats_markdown content
         if step is None:
@@ -407,6 +524,7 @@ class Viewer:
     def handle_disconnect(self, client: viser.ClientHandle) -> None:
         self.render_statemachines[client.client_id].running = False
         self.render_statemachines.pop(client.client_id)
+        self.pose_notifications.pop(client.client_id, None)
 
     def handle_new_client(self, client: viser.ClientHandle) -> None:
         self.render_statemachines[client.client_id] = RenderStateMachine(self, VISER_NERFSTUDIO_SCALE_RATIO, client)
@@ -503,6 +621,9 @@ class Viewer:
         # draw the training cameras and images
         self.camera_handles: Dict[int, viser.CameraFrustumHandle] = {}
         self.original_c2w: Dict[int, np.ndarray] = {}
+        self.num_train_images = len(train_dataset)
+        self.train_camera_c2ws = train_dataset.cameras.camera_to_worlds.cpu().numpy()
+        self.image_index_input.max = max(0, self.num_train_images - 1)
         image_indices = self._pick_drawn_image_idxs(len(train_dataset))
         for idx in image_indices:
             image = train_dataset[idx]["image"]
@@ -529,16 +650,17 @@ class Viewer:
                 position=c2w[:3, 3] * VISER_NERFSTUDIO_SCALE_RATIO,
             )
 
-            def create_on_click_callback(capture_idx):
+            def create_on_click_callback(capture_idx, capture_c2w):
                 def on_click_callback(event: viser.SceneNodePointerEvent[viser.CameraFrustumHandle]) -> None:
                     with event.client.atomic():
                         event.client.camera.position = event.target.position
                         event.client.camera.wxyz = event.target.wxyz
                         self.current_camera_idx = capture_idx
+                        self._update_selected_pose_display(event.client, capture_idx, capture_c2w)
 
                 return on_click_callback
 
-            camera_handle.on_click(create_on_click_callback(idx))
+            camera_handle.on_click(create_on_click_callback(idx, c2w.copy()))
 
             self.camera_handles[idx] = camera_handle
             self.original_c2w[idx] = c2w

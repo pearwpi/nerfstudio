@@ -226,6 +226,12 @@ class RenderStateMachine(threading.Thread):
                 # if we are in high res and we get a static action, we don't need to do anything
                 continue
             self.state = self.transitions[self.state][action.action]
+
+            if not self.viewer.render_model_checkbox.value:
+                # Show only scene geometry (e.g. train cameras) when model rendering is disabled.
+                self.client.scene.set_background_image(None, depth=None)
+                continue
+
             try:
                 outputs = self._render_img(action.camera_state)
                 # print(action.camera_state.c2w)
